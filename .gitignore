@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+venv/
+
+# Data/output files
+data/
+*.csv
+
+# DBT artifacts
+dbt/target/
+dbt/dbt_packages/
+
+# VSCode or PyCharm configs
+.vscode/
+.idea/
+
+# OS junk
+.DS_Store
+Thumbs.db
