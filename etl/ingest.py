@@ -1,14 +1,15 @@
+# ingest.py
+
 import os
 import requests
 from bs4 import BeautifulSoup
 import pandas as pd
 from datetime import datetime
 from sqlalchemy import create_engine
-from sqlalchemy.exc import OperationalError
-import psycopg2
-from psycopg2 import sql
+from sqlalchemy.orm import sessionmaker
+from models import BookListing
+from utils import add_missing_columns_if_needed, create_database_if_not_exists
 
-# Function to scrape book data from the website
 def scrape_books_to_scrape():
     url = "https://books.toscrape.com"
     headers = {
@@ -27,10 +28,6 @@ def scrape_books_to_scrape():
         print(f"Error fetching the webpage: {e}")
         return pd.DataFrame()  # Return an empty DataFrame in case of failure
     
-    # Debug: Save response for inspection
-    with open("data/debug.html", "w", encoding="utf-8") as f:
-        f.write(response.text)
-
     soup = BeautifulSoup(response.text, "html.parser")
     
     listings = []
@@ -41,82 +38,78 @@ def scrape_books_to_scrape():
         price = item.find("p", class_="price_color").get_text(strip=True) if item.find("p", class_="price_color") else None
         availability = item.find("p", class_="instock availability").get_text(strip=True) if item.find("p", class_="instock availability") else None
         link = item.find("h3").find("a")["href"] if item.find("h3").find("a") else None
-        full_link = url + link if link else None
+        full_link = url + "/" + link if link else None
+
+        # Scrape additional data
+        rating = item.find("p", class_="star-rating")["class"][1] if item.find("p", class_="star-rating") else None
+        image_url = item.find("img")["src"] if item.find("img") else None
+
+        # Scraping category from the book's detail page
+        category = None
+        book_page = requests.get(full_link, headers=headers, proxies=proxies, verify=True)
+        book_soup = BeautifulSoup(book_page.text, "html.parser")
+        breadcrumb = book_soup.find("ul", class_="breadcrumb")
+        breadcrumb_items = breadcrumb.find_all("li")
+        if len(breadcrumb_items) > 2:
+            category = breadcrumb_items[2].find("a").get_text(strip=True)
 
         listings.append({
             "title": title,
             "price": price,
             "availability": availability,
             "link": full_link,
+            "rating": rating,
+            "image_url": image_url,
+            "category": category,
             "date_scraped": datetime.utcnow().isoformat()
         })
 
     print(f"🔍 Scraped {len(listings)} books.")
     return pd.DataFrame(listings)
 
-# Function to check and create the database if it doesn't exist
-def create_database_if_not_exists():
-    db_user = os.getenv("DB_USER", "postgres")
-    db_pass = os.getenv("DB_PASS", "admin")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "bookdb")
-
-    try:
-        # Connect to PostgreSQL server (default database can be 'postgres')
-        conn = psycopg2.connect(
-            dbname="postgres",  # Use 'postgres' database to connect to the server
-            user=db_user,
-            password=db_pass,
-            host=db_host,
-            port=db_port
-        )
-        conn.autocommit = True  # This allows us to create a new database without starting a transaction
-        cursor = conn.cursor()
-
-        # Check if the database exists
-        cursor.execute(f"SELECT 1 FROM pg_database WHERE datname = '{db_name}'")
-        exists = cursor.fetchone()
-
-        if not exists:
-            # Create the database if it does not exist
-            cursor.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db_name)))
-            print(f"Database '{db_name}' created successfully.")
-        else:
-            print(f"Database '{db_name}' already exists.")
-
-        cursor.close()
-        conn.close()
-    except Exception as e:
-        print(f"Error while creating database: {e}")
-        if conn:
-            conn.close()
-
-# Function to save the data to PostgreSQL
 def save_to_postgres(df):
-    db_user = os.getenv("DB_USER", "postgres")
-    db_pass = os.getenv("DB_PASS", "admin")
-    db_host = os.getenv("DB_HOST", "localhost")
-    db_port = os.getenv("DB_PORT", "5432")
-    db_name = os.getenv("DB_NAME", "bookdb")
+    db_user = "postgres"
+    db_pass = "admin"
+    db_host = "localhost"
+    db_port = "5432"
+    db_name = "bookdb"
 
     DATABASE_URL = f"postgresql+psycopg2://{db_user}:{db_pass}@{db_host}:{db_port}/{db_name}"
 
-    # First, ensure the database exists
+    # Create the SQLAlchemy engine and session
+    engine = create_engine(DATABASE_URL, echo=True)
+    Session = sessionmaker(bind=engine)
+    session = Session()
+
+    # First, ensure the database and table are set up correctly
     create_database_if_not_exists()
+    add_missing_columns_if_needed(engine)
 
-    # Proceed to connect and save data if the database exists
+    # Convert the dataframe to BookListing objects
+    for index, row in df.iterrows():
+        book = BookListing(
+            title=row['title'],
+            price=row['price'],
+            availability=row['availability'],
+            link=row['link'],
+            rating=row['rating'],
+            image_url=row['image_url'],
+            category=row['category'],
+            date_scraped=row['date_scraped']
+        )
+        session.add(book)
+
     try:
-        engine = create_engine(DATABASE_URL)
-        df.to_sql("books_to_scrape_listings", engine, if_exists="append", index=False)
+        session.commit()
         print("✅ Data saved to PostgreSQL!")
-    except OperationalError as e:
-        print(f"Error connecting to PostgreSQL: {e}")
+    except Exception as e:
+        session.rollback()
+        print(f"Error saving data: {e}")
+    finally:
+        session.close()
 
-# Main execution
 if __name__ == "__main__":
     df = scrape_books_to_scrape()  # This is where the error was happening earlier
-    
     if not df.empty:
         print(df.head())
         df.to_csv("data/books_to_scrape_listings.csv", index=False)
